@@ -26,6 +26,8 @@ import { GpsData } from './GpsData';
 import { BleScanner, DiscoveredCamera } from '../ble/BleScanner';
 import { PreferencesRepository } from '../data/PreferencesRepository';
 import { CameraSession } from './CameraSession';
+import { ConnectionPolicy, connectionPolicyLabel } from './ConnectionPolicy';
+import { liveViewController, LiveViewStatus } from './LiveViewController';
 
 const TAG = 'HarmoNiLink-CameraService';
 
@@ -77,6 +79,30 @@ export interface CameraStateEvent {
 export type StateListener = (event: CameraStateEvent) => void;
 export type OperationOwner = 'pairing' | 'connection' | 'none';
 
+export type GpsHealthLevel = 'offline' | 'acquiring' | 'healthy' | 'stale' | 'error';
+
+/** Per-camera delivery facts. A phone location fix is not considered delivered
+ * until the camera confirms the GEO characteristic write. */
+export interface GpsDeliveryHealth {
+  cameraName: string;
+  lastGeoAttemptAt: number;
+  lastGeoWriteAt: number;
+  lastErrorAt: number;
+  consecutiveFailures: number;
+  lastError: string;
+}
+
+/** Compact aggregate consumed by the connection page and its persistent island. */
+export interface GpsHealthSummary {
+  level: GpsHealthLevel;
+  title: string;
+  detail: string;
+  readyCameraCount: number;
+  lastGeoWriteAt: number;
+  locationAccuracy: number;
+  policy: ConnectionPolicy;
+}
+
 /** A camera awaiting reconnect on the shared scan (reconnectPool). */
 interface ReconnectWatch {
   camera: PairedCamera;
@@ -102,17 +128,12 @@ export class CameraService {
   // ==== Private shared state ====
 
   private stateListeners: StateListener[] = [];
-  private devicesChangedListeners: Array<() => void> = [];
   // Sessions keyed by camera name — multiple in Phase 1.
   private sessions: Map<string, CameraSession> = new Map();
   // Reconnect pool: cameras waiting for their BLE address to be found by ONE
   // shared scan (routed by manufacturerDevice), instead of one scan each.
   private reconnectWatchers: ReconnectWatch[] = [];
-  // True while the ONE shared BLE scan is running. The scanner is a SINGLE-
-  // listener model, so pairing scan and reconnect scan must NOT each call
-  // scanner.startScan() (the second would replace the first's listener and
-  // strand reconnect sessions). ensureScanRunning() is the sole caller.
-  private scanRunning: boolean = false;
+  private reconnectScanActive: boolean = false;
 
   // Ownership — prevents cross-tab operation conflicts (Hub-level mutex).
   private owner: OperationOwner = 'none';
@@ -134,14 +155,16 @@ export class CameraService {
 
   // Background task state — one ContinuousTask per app.
   private backgroundTaskStarted: boolean = false;
-  // Generation guard for the async start()/sync stop() race: stop() bumps this
-  // so an in-flight start() (getWantAgent/startBackgroundRunning are awaited)
-  // can detect it landed after a stop request and immediately undo itself.
-  private bgGeneration: number = 0;
 
   // GPS ticker — one interval + alternating TIME/GEO, fanned out to Ready sessions.
   private gpsTimer: number | null = null;
   private gpsStep: number = 0; // 0=TIME, 1=GEO — alternating
+  private activeGpsIntervalMs: number = 0;
+  private gpsHealthByCamera: Map<string, GpsDeliveryHealth> = new Map();
+  private lastSampleLatitude: number | null = null;
+  private lastSampleLongitude: number | null = null;
+  private lastSampleAt: number = 0;
+  private lastMotionMetersPerSecond: number = 0;
 
   // "保持连接" is a PER-CAMERA flag on PairedCamera (Phase 3). No global
   // toggle state lives here anymore — see isKeepAlive/setKeepAlive below.
@@ -158,24 +181,6 @@ export class CameraService {
     };
   }
 
-  /** Subscribe to paired-device-list changes (pair saved / camera removed).
-   * Fired so the Pairing page can re-render its 已配对 markers — a live prefs
-   * read that ForEach only refreshes when its key changes. */
-  onDevicesChanged(listener: () => void): () => void {
-    this.devicesChangedListeners.push(listener);
-    return () => {
-      const idx = this.devicesChangedListeners.indexOf(listener);
-      if (idx !== -1) this.devicesChangedListeners.splice(idx, 1);
-    };
-  }
-
-  /** Notify subscribers that the paired-device set changed (save / remove). */
-  notifyDevicesChanged(): void {
-    for (let i = 0; i < this.devicesChangedListeners.length; i++) {
-      this.devicesChangedListeners[i]();
-    }
-  }
-
   getOwner(): OperationOwner { return this.owner; }
 
   getAbilityContext(): common.UIAbilityContext | null { return this.abilityContext; }
@@ -185,19 +190,31 @@ export class CameraService {
     return this.prefs.getOrCreateControllerName();
   }
 
+  getConnectionPolicy(): ConnectionPolicy {
+    return this.prefs.getConnectionPolicySync();
+  }
+
+  setConnectionPolicy(policy: ConnectionPolicy): void {
+    if (this.getConnectionPolicy() === policy) return;
+    this.prefs.saveConnectionPolicy(policy);
+    hilog.info(0x0001, TAG, `[GPS] policy=${policy}`);
+    this.refreshGpsIntervalIfNeeded();
+    this.syncSystemLiveView();
+  }
+
   setContext(ctx: common.UIAbilityContext): void {
-    // Idempotent: EntryAbility.onCreate calls this early so prefs.init() can
-    // finish before MainPage reads the persisted tab index (no flash-of-wrong-
-    // tab). MainPage still calls it (to refresh abilityContext); only the FIRST
-    // call triggers the one-time satellite subscribe + async prefs load.
-    const first = this.abilityContext === null;
     this.abilityContext = ctx;
-    if (!first) return;
+    liveViewController.setContext(ctx);
     // Satellite subscription is INDEPENDENT of camera connection: the GNSS
     // satellite count is a device-level reading that must NOT reset to "--"
     // when all cameras drop. Subscribe once at startup, keep it alive.
     this.subscribeSatelliteStatus();
-    this.prefs.init(ctx); // async init — loadSavedCamerasSync will return cache once ready
+    this.prefs.init(ctx).then(() => {
+      // A stored policy may differ from the startup default. Reconfigure an
+      // already-running ticker as soon as preferences finish loading.
+      this.refreshGpsIntervalIfNeeded();
+      this.syncSystemLiveView();
+    });
   }
 
   // ==================== 保持连接 (per-camera auto-reconnect, Phase 3) ====================
@@ -218,9 +235,7 @@ export class CameraService {
       const s = this.sessions.get(name);
       if (s) s.onKeepAliveDisabled();
     }
-    // Turning ON creates reconnect intent — the ContinuousTask must start now
-    // (before any camera is Ready), not only when the GPS ticker spins up.
-    this.reconcileBackgroundTask();
+    this.syncSystemLiveView();
   }
 
   /** True if the first-connect hint (camera "关闭时发送" + keep-alive) has never been shown. */
@@ -254,29 +269,6 @@ export class CameraService {
    * startPendingConnect(), so the count here is the OTHERS already ON. */
   shouldWarnMultiCam(): boolean {
     return this.getKeepAliveCount() >= MULTI_CAM_WARN_THRESHOLD && !this.wasMultiCamWarned();
-  }
-
-  // ==================== Tab 持久化 + 关于 ====================
-
-  /** Last selected tab index, persisted so the app reopens on the same page. */
-  loadLastTabIndex(): number {
-    return this.prefs.loadLastTabIndexSync();
-  }
-
-  /** Resolves once prefs.init() has loaded persisted values — MainPage waits
-   * on this before reading the tab index, so the first render is correct
-   * (no flash of the wrong tab on slow disks / large camera lists). */
-  whenPrefsReady(): Promise<void> {
-    return this.prefs.whenReady();
-  }
-
-  saveLastTabIndex(index: number): void {
-    this.prefs.saveLastTabIndex(index);
-  }
-
-  /** Reset the one-time hints so they show again (关于 → 重置引导). */
-  resetOnboarding(): void {
-    this.prefs.resetOnboarding();
   }
 
   // ==================== Permissions ====================
@@ -379,22 +371,6 @@ export class CameraService {
     return this.owner === 'pairing';
   }
 
-  /**
-   * True while the pairing tab is in the classic-BONDING phase — the ONLY
-   * radio-exclusive window (classic BT discovery + pairDevice). The pairing
-   * SCAN (withClassic=false) and BLE handshake run fine in parallel with
-   * connection operations, so connection ops defer to BONDING, not to the
-   * whole pairing flow (otherwise a pairing scan would needlessly lock the
-   * Connection page).
-   */
-  isPairingBonding(): boolean {
-    if (this.owner !== 'pairing') return false;
-    for (const s of this.sessions.values()) {
-      if (s.isPairModeSession() && s.getState() === ConnectionState.Bonding) return true;
-    }
-    return false;
-  }
-
   // ==================== Scan (Pairing Page, shared) ====================
 
   startPairingScan(): boolean {
@@ -403,18 +379,15 @@ export class CameraService {
     this.discoveredList = [];
     this.pairScanActive = true;
     this.broadcastSessionState('', ConnectionState.Scanning, '正在扫描设备…');
-    this.ensureScanRunning();
+    this.scanner.startScan((cameras: DiscoveredCamera[]) => {
+      this.discoveredList = cameras;
+    }, false); // NO classic discovery — it starves connected cameras' GPS writes (P1-5);
+    // classic discovery only runs later, inside the short bonding window
     return true;
   }
 
   getDiscoveredCameras(): DiscoveredCamera[] {
     return this.discoveredList;
-  }
-
-  /** True while the pairing-page scan is actively running — lets PairingPage
-   * re-sync its 蓝牙扫描 toggle when its component instance is recreated. */
-  isPairScanning(): boolean {
-    return this.pairScanActive;
   }
 
   /**
@@ -426,7 +399,10 @@ export class CameraService {
   stopPairingScanOnly(): void {
     if (!this.pairScanActive) return;
     this.pairScanActive = false;
-    this.ensureScanRunning();
+    if (this.reconnectWatchers.length === 0) {
+      this.scanner.stopScan(); // nobody else needs the scan
+    }
+    // else: shared reconnect scan keeps running for the remaining watchers
   }
 
   stopPairingScan(): void {
@@ -438,32 +414,9 @@ export class CameraService {
     }
   }
 
-  /**
-   * Single scan-entry point. The BleScanner holds ONE listener, so a pairing
-   * scan must never replace a reconnect scan's listener (or reconnect sessions
-   * strand in Scanning forever). Start/stop the ONE scan based on whether ANY
-   * consumer (pairing page or reconnect watchers) needs it, and route every
-   * result to BOTH consumers.
-   */
-  private ensureScanRunning(): void {
-    const needed = this.pairScanActive || this.reconnectWatchers.length > 0;
-    if (needed && !this.scanRunning) {
-      this.scanRunning = true;
-      this.scanner.startScan((cameras: DiscoveredCamera[]) => {
-        this.discoveredList = cameras;
-        this.routeReconnect(cameras);
-      }, false); // NO classic discovery — it starves connected cameras' GPS writes (P1-5)
-    } else if (!needed && this.scanRunning) {
-      this.scanRunning = false;
-      this.scanner.stopScan();
-    }
-  }
-
   // ==================== Delegated per-camera operations ====================
 
-  /** Pairing progress of the in-flight pairing session (pairing is serial).
-   *  DEPRECATED for success detection — a previously-connected camera keeps
-   *  its step=6 and would pollute the max. Use getPairingStepFor(name). */
+  /** Pairing progress of the in-flight pairing session (pairing is serial). */
   getPairingStep(): number {
     let step = 0;
     this.sessions.forEach((s: CameraSession) => {
@@ -471,14 +424,6 @@ export class CameraService {
       if (ps > step) step = ps;
     });
     return step;
-  }
-
-  /** Pairing step of ONE camera's session (0 if none). Success detection must
-   * be per-session: a sibling camera's step=6 must not fake a success for a
-   * camera whose own bonding just failed. */
-  getPairingStepFor(name: string): number {
-    const s = this.sessions.get(name);
-    return s !== undefined ? s.getPairingStep() : 0;
   }
 
   /** True if a session for this camera exists and is connected. */
@@ -533,10 +478,6 @@ export class CameraService {
 
   cancelPairing(): void {
     this.sessions.forEach((s: CameraSession) => {
-      // Scope to PAIRING sessions only — a parallel connection-page connect
-      // (Connecting/Discovering/Pairing) must NOT be torn down by cancelling
-      // the pairing tab's operation.
-      if (!s.isPairModeSession()) return;
       const st = s.getState();
       if (st === ConnectionState.Connecting || st === ConnectionState.Discovering
         || st === ConnectionState.Pairing || st === ConnectionState.Bonding) {
@@ -566,42 +507,25 @@ export class CameraService {
       this.ensureGpsRunning();
     } else {
       this.stopGpsLoop();
-    }
-    // The GPS ticker and the ContinuousTask have DIFFERENT lifecycles: the
-    // ticker needs a Ready session to write to, but the ContinuousTask must
-    // outlive it — a keep-alive camera in reconnect (backoff/scan/connect) has
-    // no Ready session, yet needs the process kept alive or the reconnect
-    // timer can never fire (suspended app → no reconnection, ever).
-    this.reconcileBackgroundTask();
-  }
-
-  /** True while any camera has its connection toggle ON — the INTENT alone
-   * warrants the ContinuousTask (see reconcileBackgroundTask). */
-  hasKeepAliveIntent(): boolean {
-    return this.prefs.loadSavedCamerasSync().some((c: PairedCamera) => c.keepAlive);
-  }
-
-  /** Start/stop the ContinuousTask to match current connection intent:
-   * keep it while any camera is Ready (GPS writing) OR has keep-alive intent
-   * (reconnecting in the background); stop it only when neither holds. */
-  private reconcileBackgroundTask(): void {
-    const need = this.getReadySessions().length > 0 || this.hasKeepAliveIntent();
-    if (need) {
-      this.startBackgroundTask();
-    } else {
       this.stopBackgroundTask();
     }
+    this.syncSystemLiveView();
   }
 
-  /** Start the ticker only if it isn't already running (no satellite reset). */
+  /** Start the ticker only if it isn't already running, or reconfigure it when
+   * a policy/location change selects a different cadence. */
   private ensureGpsRunning(): void {
-    if (this.gpsTimer !== null) return;
+    if (this.gpsTimer !== null) {
+      this.refreshGpsIntervalIfNeeded();
+      return;
+    }
     this.startGpsLoop();
   }
 
-  startGpsLoop(intervalMs: number = 1500): void {
-    const interval = this.isForeground ? intervalMs : 5000;
-    hilog.info(0x0001, TAG, `[GPS] startGpsLoop: interval=${interval}ms fg=${this.isForeground}`);
+  startGpsLoop(): void {
+    const interval = this.getGpsIntervalMs();
+    hilog.info(0x0001, TAG,
+      `[GPS] startGpsLoop: policy=${this.getConnectionPolicy()} interval=${interval}ms fg=${this.isForeground}`);
     this.stopGpsLoop();
     // Idempotent retry: setContext() subscribes at startup, but location
     // permission may not be granted yet then (it's requested on first scan).
@@ -611,7 +535,45 @@ export class CameraService {
     // Send TIME immediately, then alternate TIME/GEO
     this.sendGpsTick();
     this.gpsTimer = setInterval(() => { this.sendGpsTick(); }, interval);
+    this.activeGpsIntervalMs = interval;
     this.startBackgroundTask();
+  }
+
+  private refreshGpsIntervalIfNeeded(): void {
+    if (this.gpsTimer === null) return;
+    const nextInterval = this.getGpsIntervalMs();
+    if (nextInterval === this.activeGpsIntervalMs) return;
+    clearInterval(this.gpsTimer);
+    this.gpsTimer = setInterval(() => { this.sendGpsTick(); }, nextInterval);
+    this.activeGpsIntervalMs = nextInterval;
+    hilog.info(0x0001, TAG,
+      `[GPS] cadence adjusted: policy=${this.getConnectionPolicy()} interval=${nextInterval}ms`);
+  }
+
+  private getGpsIntervalMs(): number {
+    const foreground = this.isForeground;
+    const policy = this.getConnectionPolicy();
+    if (policy === ConnectionPolicy.Stable) return foreground ? 1500 : 5000;
+    if (policy === ConnectionPolicy.Balanced) return foreground ? 5000 : 15000;
+    if (policy === ConnectionPolicy.PowerSaving) return foreground ? 15000 : 30000;
+
+    // Auto: recover quickly from weak delivery, follow fast movement, then
+    // settle into a low-power cadence when the phone remains still.
+    if (!this.gpsData.hasFix || this.hasRecentGpsFailure()) return foreground ? 3000 : 8000;
+    if (this.lastMotionMetersPerSecond >= 8) return foreground ? 2500 : 8000;
+    if (this.lastMotionMetersPerSecond >= 1.5) return foreground ? 5000 : 15000;
+    return foreground ? 15000 : 30000;
+  }
+
+  private hasRecentGpsFailure(): boolean {
+    const now = Date.now();
+    let failed = false;
+    this.gpsHealthByCamera.forEach((health: GpsDeliveryHealth) => {
+      if (health.lastErrorAt > health.lastGeoWriteAt && now - health.lastErrorAt < 60000) {
+        failed = true;
+      }
+    });
+    return failed;
   }
 
   /** Ready sessions — only those whose handshake finished (chars prepared).
@@ -646,6 +608,7 @@ export class CameraService {
         const locEnabled = geoLocationManager.isLocationEnabled?.() ?? true;
         if (!locEnabled) {
           hilog.warn(0x0001, TAG, '[GPS] Location service disabled, skip GEO');
+          this.recordLocationFailure('系统定位服务未开启');
           return;
         }
       } catch (e) { /* proceed anyway */ }
@@ -661,13 +624,19 @@ export class CameraService {
           const lat = pos.latitude;
           const lon = pos.longitude;
           const alt = Math.round(pos.altitude);
+          const accuracy = pos.accuracy;
           const sats = this.lastSatelliteCount;
+          const now = Date.now();
           this.gpsData.hasFix = true;
           this.gpsData.latitude = lat;
           this.gpsData.longitude = lon;
           this.gpsData.altitude = alt;
           this.gpsData.satellites = sats;
           this.gpsData.lastUpdateTime = new Date().toLocaleTimeString();
+          this.gpsData.lastLocationAt = now;
+          this.gpsData.lastLocationAccuracy = accuracy;
+          this.gpsData.lastLocationError = '';
+          this.updateMotionEstimate(lat, lon, now);
 
           const gps: GpsPosition = {
             latitude: lat, longitude: lon, altitude: alt,
@@ -678,11 +647,14 @@ export class CameraService {
           for (let i = 0; i < stillReady.length; i++) {
             this.staggeredWrite(stillReady[i], i, payload, false);
           }
+          this.refreshGpsIntervalIfNeeded();
         }).catch(() => {
           hilog.debug(0x0001, TAG, '[GPS] GEO skip — no location');
+          this.recordLocationFailure('未能获取定位');
         });
       } catch (e) {
         hilog.debug(0x0001, TAG, '[GPS] GEO skip — exception');
+        this.recordLocationFailure('定位服务异常');
       }
     }
   }
@@ -696,7 +668,12 @@ export class CameraService {
   private staggeredWrite(session: CameraSession, index: number, payload: Uint8Array, isTime: boolean): void {
     const delay = index * GPS_PHASE_STAGGER_MS;
     const doWrite = (): void => {
-      if (isTime) { session.writeTime(payload); } else { session.writeGeo(payload); }
+      if (isTime) {
+        session.writeTime(payload);
+      } else {
+        this.recordGeoWriteAttempt(session.getCameraName());
+        session.writeGeo(payload);
+      }
     };
     if (delay === 0) {
       doWrite();
@@ -709,6 +686,7 @@ export class CameraService {
     if (this.gpsTimer !== null) {
       clearInterval(this.gpsTimer);
       this.gpsTimer = null;
+      this.activeGpsIntervalMs = 0;
       hilog.info(0x0001, TAG, '[CHECKPOINT] GPS loop stopped');
     }
     // Satellite subscription is independent of the ticker — do NOT reset
@@ -731,6 +709,201 @@ export class CameraService {
       this.satelliteStatusCb = null;
       hilog.warn(0x0001, TAG, `[GPS] satelliteStatusChange subscribe failed: ${JSON.stringify(err)}`);
     }
+  }
+
+  // ==================== GPS Delivery Health ====================
+
+  getGpsHealth(cameraName: string): GpsDeliveryHealth {
+    const health = this.gpsHealthByCamera.get(cameraName);
+    if (health) return { ...health };
+    return this.newGpsHealth(cameraName);
+  }
+
+  getGpsHealthSummary(): GpsHealthSummary {
+    const policy = this.getConnectionPolicy();
+    const ready = this.getReadySessions();
+    const active = this.getActiveSessionCount();
+    if (ready.length === 0) {
+      const recentFailure = this.getLatestGpsFailure();
+      if (recentFailure && (active > 0 || this.getKeepAliveCount() > 0)
+        && Date.now() - recentFailure.lastErrorAt < 60000) {
+        return this.healthSummary('error', 'GPS 传输异常',
+          `${recentFailure.lastError}，正在等待重连。`, 0, recentFailure.lastGeoWriteAt, policy);
+      }
+      if (this.owner === 'pairing') {
+        return this.healthSummary('acquiring', '正在配对', '配对完成后将开始 GPS 下发。', 0, 0, policy);
+      }
+      if (active > 0 || this.getKeepAliveCount() > 0) {
+        return this.healthSummary('acquiring', '正在连接', '等待相机完成连接与服务发现。', 0, 0, policy);
+      }
+      return this.healthSummary('offline', '未连接相机', '打开相机连接开关后开始监控 GPS 传输。', 0, 0, policy);
+    }
+
+    if (!this.gpsData.hasFix || this.gpsData.lastLocationAt === 0) {
+      const detail = this.gpsData.lastLocationError !== ''
+        ? this.gpsData.lastLocationError
+        : '已连接相机，等待手机提供有效位置。';
+      return this.healthSummary('acquiring', '正在获取定位', detail, ready.length, 0, policy);
+    }
+
+    let newestWrite = 0;
+    let unconfirmedCamera: GpsDeliveryHealth | null = null;
+    let failedCamera: GpsDeliveryHealth | null = null;
+    for (let i = 0; i < ready.length; i++) {
+      const health = this.getGpsHealth(ready[i].getCameraName());
+      newestWrite = Math.max(newestWrite, health.lastGeoWriteAt);
+      if (health.lastGeoWriteAt === 0) unconfirmedCamera = health;
+      if (health.lastErrorAt > health.lastGeoWriteAt) failedCamera = health;
+    }
+
+    if (failedCamera) {
+      return this.healthSummary('error', 'GPS 传输异常',
+        `${failedCamera.cameraName}：${failedCamera.lastError}`, ready.length, newestWrite, policy);
+    }
+
+    if (unconfirmedCamera || newestWrite === 0) {
+      const detail = unconfirmedCamera
+        ? `${unconfirmedCamera.cameraName} 等待确认 GEO 写入。`
+        : '已获取位置，等待相机确认 GEO 写入。';
+      return this.healthSummary('acquiring', '等待相机确认', detail, ready.length, newestWrite, policy);
+    }
+
+    const now = Date.now();
+    const stale = now - newestWrite > this.getGpsStaleAfterMs();
+    if (stale) {
+      return this.healthSummary('stale', 'GPS 确认已过期',
+        `相机最后确认于 ${this.relativeTime(newestWrite)}。`,
+        ready.length, newestWrite, policy);
+    }
+
+    return this.healthSummary('healthy', 'GPS 正在下发',
+      `${ready.length} 台相机已确认，最近一次 ${this.relativeTime(newestWrite)}。`,
+      ready.length, newestWrite, policy);
+  }
+
+  recordGeoWriteSuccess(cameraName: string): void {
+    if (cameraName === '') return;
+    const health = this.ensureGpsHealth(cameraName);
+    health.lastGeoWriteAt = Date.now();
+    health.consecutiveFailures = 0;
+    health.lastError = '';
+    hilog.debug(0x0001, TAG, `[GPS] GEO confirmed by '${cameraName}'`);
+    this.refreshGpsIntervalIfNeeded();
+    this.syncSystemLiveView();
+  }
+
+  recordGeoWriteFailure(cameraName: string, reason: string): void {
+    if (cameraName === '') return;
+    const health = this.ensureGpsHealth(cameraName);
+    health.lastErrorAt = Date.now();
+    health.consecutiveFailures++;
+    health.lastError = reason;
+    hilog.warn(0x0001, TAG,
+      `[GPS] GEO delivery failure for '${cameraName}': ${reason} (${health.consecutiveFailures})`);
+    this.refreshGpsIntervalIfNeeded();
+    this.syncSystemLiveView();
+  }
+
+  private recordGeoWriteAttempt(cameraName: string): void {
+    if (cameraName === '') return;
+    this.ensureGpsHealth(cameraName).lastGeoAttemptAt = Date.now();
+  }
+
+  private recordLocationFailure(reason: string): void {
+    this.gpsData.hasFix = false;
+    this.gpsData.lastLocationError = reason;
+    this.refreshGpsIntervalIfNeeded();
+    this.syncSystemLiveView();
+  }
+
+  private getLatestGpsFailure(): GpsDeliveryHealth | null {
+    let latest: GpsDeliveryHealth | null = null;
+    this.gpsHealthByCamera.forEach((health: GpsDeliveryHealth) => {
+      if (health.lastError === '') return;
+      if (latest === null || health.lastErrorAt > latest.lastErrorAt) latest = health;
+    });
+    return latest;
+  }
+
+  private ensureGpsHealth(cameraName: string): GpsDeliveryHealth {
+    const existing = this.gpsHealthByCamera.get(cameraName);
+    if (existing) return existing;
+    const health = this.newGpsHealth(cameraName);
+    this.gpsHealthByCamera.set(cameraName, health);
+    return health;
+  }
+
+  private newGpsHealth(cameraName: string): GpsDeliveryHealth {
+    return {
+      cameraName: cameraName,
+      lastGeoAttemptAt: 0,
+      lastGeoWriteAt: 0,
+      lastErrorAt: 0,
+      consecutiveFailures: 0,
+      lastError: '',
+    };
+  }
+
+  private getActiveSessionCount(): number {
+    let count = 0;
+    this.sessions.forEach((session: CameraSession) => {
+      if (session.getState() !== ConnectionState.Idle) count++;
+    });
+    return count;
+  }
+
+  private healthSummary(
+    level: GpsHealthLevel,
+    title: string,
+    detail: string,
+    readyCameraCount: number,
+    lastGeoWriteAt: number,
+    policy: ConnectionPolicy
+  ): GpsHealthSummary {
+    return {
+      level: level,
+      title: title,
+      detail: detail,
+      readyCameraCount: readyCameraCount,
+      lastGeoWriteAt: lastGeoWriteAt,
+      locationAccuracy: this.gpsData.lastLocationAccuracy,
+      policy: policy,
+    };
+  }
+
+  private getGpsStaleAfterMs(): number {
+    return Math.max(this.getGpsIntervalMs() * 3, 15000);
+  }
+
+  private relativeTime(timestamp: number): string {
+    const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+    if (seconds < 5) return '刚刚';
+    if (seconds < 60) return `${seconds} 秒前`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes} 分钟前`;
+    return new Date(timestamp).toLocaleTimeString();
+  }
+
+  private updateMotionEstimate(latitude: number, longitude: number, timestamp: number): void {
+    if (this.lastSampleLatitude !== null && this.lastSampleLongitude !== null && this.lastSampleAt > 0) {
+      const distance = this.distanceMeters(this.lastSampleLatitude, this.lastSampleLongitude, latitude, longitude);
+      const seconds = Math.max(1, (timestamp - this.lastSampleAt) / 1000);
+      this.lastMotionMetersPerSecond = Math.min(60, distance / seconds);
+    }
+    this.lastSampleLatitude = latitude;
+    this.lastSampleLongitude = longitude;
+    this.lastSampleAt = timestamp;
+  }
+
+  private distanceMeters(lat1: number, lon1: number, lat2: number, lon2: number): number {
+    const earthRadius = 6371000;
+    const toRadians = (degree: number): number => degree * Math.PI / 180;
+    const dLat = toRadians(lat2 - lat1);
+    const dLon = toRadians(lon2 - lon1);
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+      + Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2))
+      * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    return earthRadius * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   }
 
   // ==================== Persistence ====================
@@ -762,9 +935,8 @@ export class CameraService {
     // Drop the session entirely: a re-pair of the same camera must start from
     // a fresh session, not inherit this one's leftovers.
     this.sessions.delete(name);
+    this.gpsHealthByCamera.delete(name);
     this.refreshGps();
-    // Pairing page must drop the deleted camera's 已配对 marker.
-    this.notifyDevicesChanged();
   }
 
   // ==================== Lifecycle (App Background/Foreground) ====================
@@ -773,22 +945,18 @@ export class CameraService {
     hilog.info(0x0001, TAG, '[LIFECYCLE] App → Background');
     this.isForeground = false;
     if (this.getReadySessions().length > 0) {
-      this.stopGpsLoop();
-      this.startGpsLoop(5000); // switch to slow background interval
+      this.refreshGpsIntervalIfNeeded();
     }
-    // A keep-alive camera mid-reconnect has no Ready session — ensure the
-    // ContinuousTask is up so the background reconnect survives suspension.
-    this.reconcileBackgroundTask();
+    this.syncSystemLiveView();
   }
 
   onAppForeground(): void {
     hilog.info(0x0001, TAG, '[LIFECYCLE] App → Foreground');
     this.isForeground = true;
     if (this.getReadySessions().length > 0) {
-      this.stopGpsLoop();
-      this.startGpsLoop(); // restore default 1500ms interval
+      this.refreshGpsIntervalIfNeeded();
     }
-    this.reconcileBackgroundTask();
+    this.syncSystemLiveView();
   }
 
   // ==================== Background Task ====================
@@ -797,7 +965,6 @@ export class CameraService {
     if (this.backgroundTaskStarted || !this.abilityContext) return;
 
     const ctx = this.abilityContext;
-    const gen = this.bgGeneration; // this request's generation
 
     let wantAgentInfo: wantAgent.WantAgentInfo = {
       wants: [
@@ -813,18 +980,10 @@ export class CameraService {
 
     try {
       const agent: WantAgent = await wantAgent.getWantAgent(wantAgentInfo);
-      if (gen !== this.bgGeneration) return; // a stop() raced in — abandon
       try {
         await backgroundTaskManager.startBackgroundRunning(ctx,
           backgroundTaskManager.BackgroundMode.BLUETOOTH_INTERACTION |
           backgroundTaskManager.BackgroundMode.LOCATION, agent);
-        if (gen !== this.bgGeneration) {
-          // Start landed after a stop request — immediately undo it, else the
-          // notification task hangs while every switch is off.
-          hilog.info(0x0001, TAG, '[BG] ContinuousTask started after stop — undoing');
-          try { backgroundTaskManager.stopBackgroundRunning(ctx); } catch (e) { /* best-effort */ }
-          return;
-        }
         this.backgroundTaskStarted = true;
         hilog.info(0x0001, TAG, '[BG] ContinuousTask started (BLUETOOTH + LOCATION)');
       } catch (err) {
@@ -838,7 +997,6 @@ export class CameraService {
   }
 
   stopBackgroundTask(): void {
-    this.bgGeneration++; // invalidate any in-flight start()
     if (!this.backgroundTaskStarted || !this.abilityContext) return;
 
     try {
@@ -851,6 +1009,10 @@ export class CameraService {
     }
   }
 
+  stopSystemLiveView(): void {
+    liveViewController.stop(this.toLiveViewStatus());
+  }
+
   // ==================== State broadcast ====================
 
   /** Broadcast a per-camera (or global, name='') state change to all listeners. */
@@ -859,6 +1021,7 @@ export class CameraService {
     for (let i = 0; i < this.stateListeners.length; i++) {
       this.stateListeners[i]({ cameraName, state, message });
     }
+    this.syncSystemLiveView();
   }
 
   // ==================== Reconnect pool (shared scan) ====================
@@ -871,12 +1034,22 @@ export class CameraService {
   watchReconnect(camera: PairedCamera, session: CameraSession): void {
     this.unwatchReconnect(camera.name); // dedupe by name
     this.reconnectWatchers.push({ camera, session });
-    this.ensureScanRunning();
+    if (!this.reconnectScanActive) {
+      this.reconnectScanActive = true;
+      this.scanner.startScan((cameras: DiscoveredCamera[]) => {
+        this.routeReconnect(cameras);
+      }, false); // reconnect scan — never classic discovery (it starves GPS writes)
+    }
   }
 
   unwatchReconnect(name: string): void {
     this.reconnectWatchers = this.reconnectWatchers.filter((w) => w.camera.name !== name);
-    this.ensureScanRunning();
+    if (this.reconnectWatchers.length === 0 && this.reconnectScanActive) {
+      this.reconnectScanActive = false;
+      // The pairing tab's scan may be riding the same underlying scan —
+      // only stop the hardware scan when nobody needs it anymore.
+      if (!this.pairScanActive) this.scanner.stopScan();
+    }
   }
 
   /** Shared-scan callback: match each watcher by device ID (name fallback). */
@@ -906,6 +1079,23 @@ export class CameraService {
       this.sessions.set(name, s);
     }
     return s;
+  }
+
+  private syncSystemLiveView(): void {
+    liveViewController.sync(this.toLiveViewStatus(), this.isForeground);
+  }
+
+  private toLiveViewStatus(): LiveViewStatus {
+    const summary = this.getGpsHealthSummary();
+    return {
+      level: summary.level,
+      title: summary.title,
+      detail: summary.detail,
+      readyCameraCount: summary.readyCameraCount,
+      lastGeoWriteAt: summary.lastGeoWriteAt,
+      locationAccuracy: summary.locationAccuracy,
+      policyLabel: connectionPolicyLabel(summary.policy)
+    };
   }
 }
 

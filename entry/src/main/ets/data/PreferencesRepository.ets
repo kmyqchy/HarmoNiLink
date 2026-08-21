@@ -11,6 +11,7 @@ import { preferences } from '@kit.ArkData';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { common } from '@kit.AbilityKit';
 import { PairedCamera } from '../ble/protocol/NikonPairingEngine';
+import { ConnectionPolicy, isConnectionPolicy } from '../service/ConnectionPolicy';
 
 const TAG = 'HarmoNiLink-Prefs';
 const STORE_NAME = 'harmonilink_prefs';
@@ -18,7 +19,7 @@ const KEY_CAMERAS = 'paired_cameras';
 const KEY_CONTROLLER_NAME = 'controller_name';
 const KEY_CONNECT_HINT_SHOWN = 'connect_hint_shown';
 const KEY_MULTI_CAM_WARNED = 'multi_cam_warned'; // beyond-N-cameras warning dismissed
-const KEY_LAST_TAB = 'last_tab_index'; // last selected tab (配对/连接), persisted
+const KEY_CONNECTION_POLICY = 'connection_policy';
 // Suffix alphabet — no 0/O/1/I to avoid confusion when reading the name on the camera
 const SUFFIX_CHARS: string = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
@@ -37,7 +38,7 @@ export class PreferencesRepository {
   private controllerNameCache: string = '';
   private connectHintShownCache: boolean = false; // one-time first-connect hint shown
   private multiCamWarnedCache: boolean = false; // beyond-N-cameras warning "don't show again"
-  private lastTabIndexCache: number = 0; // last selected tab
+  private connectionPolicyCache: ConnectionPolicy = ConnectionPolicy.Auto;
   // Serialized disk writes. The CACHE is the single source of truth: it is
   // updated synchronously on every mutation, and queued tasks merely snapshot
   // it to disk. This kills the old read-disk-modify-write race where a slow
@@ -45,20 +46,6 @@ export class PreferencesRepository {
   // e.g. reverting a fresh keepAlive=true to false and snapping the UI toggle
   // off while the link stayed up.
   private saveQueue: Promise<void> = Promise.resolve();
-  // Readiness barrier: init() is async, but MainPage needs the persisted tab
-  // index SYNCHRONOUSLY at first render (no flash of the wrong tab). Expose
-  // whenReady() so the page waits for the load to finish before reading.
-  private ready: boolean = false;
-  private readyResolvers: Array<() => void> = [];
-
-  /** True once init() has loaded the persisted values. */
-  isReady(): boolean { return this.ready; }
-
-  /** Resolves when init() finishes (immediately if already ready). */
-  whenReady(): Promise<void> {
-    if (this.ready) return Promise.resolve();
-    return new Promise<void>((resolve) => { this.readyResolvers.push(resolve); });
-  }
 
   async init(context: common.UIAbilityContext): Promise<void> {
     try {
@@ -88,24 +75,17 @@ export class PreferencesRepository {
       if (saved) this.controllerNameCache = saved; // don't overwrite a freshly generated name
       this.connectHintShownCache = await this.store.get(KEY_CONNECT_HINT_SHOWN, false) as boolean;
       this.multiCamWarnedCache = await this.store.get(KEY_MULTI_CAM_WARNED, false) as boolean;
-      this.lastTabIndexCache = await this.store.get(KEY_LAST_TAB, 0) as number;
+      const storedPolicy = await this.store.get(KEY_CONNECTION_POLICY, ConnectionPolicy.Auto) as string;
+      this.connectionPolicyCache = isConnectionPolicy(storedPolicy)
+        ? storedPolicy as ConnectionPolicy
+        : ConnectionPolicy.Auto;
       hilog.info(0x0001, TAG, `[CHECKPOINT] PreferencesRepository initialized (${this.cache.length} cameras)`);
       for (const c of this.cache) {
         hilog.info(0x0001, TAG,
           `[CHECKPOINT]   saved: name='${c.name}' addr=${c.address} keepAlive=${c.keepAlive}`);
       }
-      // Signal readiness — MainPage may be waiting to read the persisted tab.
-      this.ready = true;
-      const resolvers = this.readyResolvers;
-      this.readyResolvers = [];
-      for (const r of resolvers) r();
     } catch (err) {
       hilog.error(0x0001, TAG, `[CHECKPOINT] PreferencesRepository init ERROR: ${JSON.stringify(err)}`);
-      // Even on failure, unblock waiters (they'll read the defaults).
-      this.ready = true;
-      const resolvers = this.readyResolvers;
-      this.readyResolvers = [];
-      for (const r of resolvers) r();
     }
   }
 
@@ -135,65 +115,41 @@ export class PreferencesRepository {
     this.putBool(KEY_MULTI_CAM_WARNED, true);
   }
 
-  // ==================== Tab 持久化 ====================
+  // ==================== 连接策略 ====================
 
-  loadLastTabIndexSync(): number {
-    return this.lastTabIndexCache;
+  getConnectionPolicySync(): ConnectionPolicy {
+    return this.connectionPolicyCache;
   }
 
-  saveLastTabIndex(index: number): void {
-    this.lastTabIndexCache = index;
-    this.putNumber(KEY_LAST_TAB, index);
+  saveConnectionPolicy(policy: ConnectionPolicy): void {
+    this.connectionPolicyCache = policy;
+    this.putString(KEY_CONNECTION_POLICY, policy);
   }
 
-  // ==================== 重置引导 (re-show one-time content) ====================
-
-  /** Reset all "show once" flags so the first-connect hint, the multi-camera
-   * warning, etc. are shown again. Invoked from the 关于 sheet. */
-  resetOnboarding(): void {
-    this.connectHintShownCache = false;
-    this.multiCamWarnedCache = false;
-    this.putBool(KEY_CONNECT_HINT_SHOWN, false);
-    this.putBool(KEY_MULTI_CAM_WARNED, false);
-    hilog.info(0x0001, TAG, '[CHECKPOINT] onboarding flags reset');
+  private async putBool(key: string, value: boolean): Promise<void> {
+    if (!this.store) {
+      setTimeout(() => { this.putBool(key, value); }, 1000);
+      return;
+    }
+    try {
+      await this.store.put(key, value);
+      await this.store.flush();
+    } catch (err) {
+      hilog.error(0x0001, TAG, `putBool(${key}) ERROR: ${JSON.stringify(err)}`);
+    }
   }
 
-  /** Serialize a scalar put through the saveQueue — otherwise rapid calls
-   * (e.g. fast tab switches) interleave put+flush and a stale value can land
-   * last. */
-  private enqueueScalarWrite(op: () => Promise<void>): void {
-    const run = (): Promise<void> => op();
-    this.saveQueue = this.saveQueue.then(run, run);
-  }
-
-  private putNumber(key: string, value: number): void {
-    this.enqueueScalarWrite(async (): Promise<void> => {
-      if (!this.store) {
-        setTimeout(() => { this.putNumber(key, value); }, 1000);
-        return;
-      }
-      try {
-        await this.store.put(key, value);
-        await this.store.flush();
-      } catch (err) {
-        hilog.error(0x0001, TAG, `putNumber(${key}) ERROR: ${JSON.stringify(err)}`);
-      }
-    });
-  }
-
-  private putBool(key: string, value: boolean): void {
-    this.enqueueScalarWrite(async (): Promise<void> => {
-      if (!this.store) {
-        setTimeout(() => { this.putBool(key, value); }, 1000);
-        return;
-      }
-      try {
-        await this.store.put(key, value);
-        await this.store.flush();
-      } catch (err) {
-        hilog.error(0x0001, TAG, `putBool(${key}) ERROR: ${JSON.stringify(err)}`);
-      }
-    });
+  private async putString(key: string, value: string): Promise<void> {
+    if (!this.store) {
+      setTimeout(() => { this.putString(key, value); }, 1000);
+      return;
+    }
+    try {
+      await this.store.put(key, value);
+      await this.store.flush();
+    } catch (err) {
+      hilog.error(0x0001, TAG, `putString(${key}) ERROR: ${JSON.stringify(err)}`);
+    }
   }
 
   /**

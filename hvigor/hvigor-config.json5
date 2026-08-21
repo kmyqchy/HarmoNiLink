@@ -1,6 +1,8 @@
 {
   "modelVersion": "6.0.0",
   "dependencies": {
+    "@ohos/hvigor": "6.24.2",
+    "postcss": "8.5.10",
     "@ohos/hvigor-ohos-plugin": "6.24.2"
   }
 }

@@ -11,8 +11,7 @@
  * Ownership model (Phase 3): the Hub's single `owner` is a PAIRING-ONLY
  * mutex (classic bonding needs the radio exclusively). Connection/reconnect
  * operations run on many sessions in parallel and never take it — they only
- * defer to the classic-BONDING phase via isPairingBonding() (a pairing scan /
- * BLE handshake runs in parallel with a connect). This replaces the old
+ * defer to an active pairing via isPairingActive(). This replaces the old
  * 'connection' owner that a sibling's early Ready could release, stranding a
  * straggler's 10s saved-address fallback (P0-1).
  *
@@ -87,11 +86,6 @@ export class CameraSession {
   // off→on cycle can't leave a stale timer aimed at the new attempt.
   private scanFallbackTimerId: number | null = null;
 
-  // Timestamp of the CURRENT connect() attempt — [TIMING] logs measure the
-  // attempt lifecycle from connect() to Ready/failure, so a silently-hanging
-  // connect (stale address, unresponsive camera) is attributable by elapsed.
-  private attemptStart: number = 0;
-
   // Pending auto-reconnect timer — dedupes scheduleReconnect() calls
   private reconnectTimerId: number | null = null;
   private reconnectRetries: number = 0; // backoff counter
@@ -113,20 +107,12 @@ export class CameraSession {
     return this.cameraName !== '' ? `[${this.cameraName}] ` : '';
   }
 
-  /** Elapsed ms since the current connect() attempt, or -1 if not started. */
-  private timingElapsed(): number {
-    return this.attemptStart > 0 ? Date.now() - this.attemptStart : -1;
-  }
-
   // ==== Getters / accessors used by the Hub's public API ====
 
   getSavedCamera(): PairedCamera | null { return this.savedCamera; }
   getPairingStep(): number { return this.pairingStep; }
   getCameraSerial(): string { return this.cameraSerial; }
   getCameraName(): string { return this.cameraName; }
-  /** True while this session is a PAIRING-page operation (new camera), not a
-   * connection-page reconnect. Used to scope cancelPairing() to pairing only. */
-  isPairModeSession(): boolean { return this.isPairMode; }
   getControllerName(): string { return this.controllerName; }
   getState(): ConnectionState { return this.state; }
   getStatusMessage(): string { return this.statusMessage; }
@@ -162,10 +148,9 @@ export class CameraSession {
 
   startReconnect(camera: PairedCamera): boolean {
     // Connection ops don't take the Hub mutex (many may run in parallel) —
-    // they only defer to the classic-BONDING phase (radio-exclusive). A pairing
-    // scan/handshake runs fine in parallel with a connect.
-    if (this.hub.isPairingBonding()) {
-      hilog.warn(0x0001, TAG, `${this.slog()}startReconnect deferred — bonding in progress`);
+    // they only defer to an active pairing (classic bonding needs the radio).
+    if (this.hub.isPairingActive()) {
+      hilog.warn(0x0001, TAG, `${this.slog()}startReconnect deferred — pairing in progress`);
       return false;
     }
     // Re-entry guard: a double-tap would otherwise open two GATT clients and
@@ -199,32 +184,17 @@ export class CameraSession {
     // timer armed to fire at the NEW attempt (it would unwatch the fresh
     // watcher and connect to a stale address).
     this.clearScanFallbackTimer();
-    this.armScanFallback(camera);
-    return true;
-  }
-
-  /**
-   * Armed 10s after the reconnect scan starts: if no advertisement matched,
-   * poke the SAVED address (which may be stale) to wake the camera into
-   * re-advertising. Re-arms while the pairing tab owns the radio — dropping
-   * the timer here would strand the session in Scanning forever (the scan was
-   * already handed to the pairing callback and won't route back).
-   */
-  private armScanFallback(camera: PairedCamera): void {
     this.scanFallbackTimerId = setTimeout(() => {
       this.scanFallbackTimerId = null;
-      if (this.state !== ConnectionState.Scanning) return;
-      if (this.hub.isPairingBonding()) {
-        this.armScanFallback(camera); // classic bonding holds the radio — retry shortly
-        return;
+      // Pairing-serial check only — a sibling session's Ready no longer
+      // gates this fallback (connection ops hold no shared owner).
+      if (this.state === ConnectionState.Scanning && !this.hub.isPairingActive()) {
+        this.hub.unwatchReconnect(camera.name);
+        hilog.info(0x0001, TAG, `${this.slog()}reconnect scan timeout, using saved address`);
+        this.connectToDevice(camera.address);
       }
-      this.hub.unwatchReconnect(camera.name);
-      hilog.info(0x0001, TAG, `${this.slog()}reconnect scan timeout, using saved address`);
-      // Saved-address POKE: wake the camera into re-advertising, not a real
-      // connect. A stale address hangs silently — give it only 30s, not the
-      // full devMatch 60s (its failure is expected, don't make the user wait).
-      this.connectToDevice(camera.address, 30000);
     }, 10000);
+    return true;
   }
 
   private clearScanFallbackTimer(): void {
@@ -351,23 +321,16 @@ export class CameraSession {
 
   // ==================== Private — connection / handshake ====================
 
-  /**
-   * @param deviceId BLE address to connect.
-   * @param connectTimeoutMs watchdog for THIS connect. Default 60s for a
-   *   devMatch/paired connect (a slow-waking camera — D5600 — can take ~30s to
-   *   establish the link, then MTU + service discovery). The saved-address
-   *   POKE (scan fell back to a possibly-stale address) passes 30s: its whole
-   *   point is to wake the camera into re-advertising, not to actually connect
-   *   — a stale address hangs silently, so cap that doomed wait shorter.
-   */
-  private connectToDevice(deviceId: string, connectTimeoutMs: number = 60000): void {
-    this.attemptStart = Date.now(); // [TIMING] anchor for this attempt
+  private connectToDevice(deviceId: string): void {
     this.setState(ConnectionState.Connecting, `正在连接 ${deviceId}…`);
     this.pairingStep = 0;
     this.currentStage1 = null;
 
     // Watchdog: if the device never responds (non-Nikon device, out of range),
     // abort instead of hanging forever. Cancelled on terminal states.
+    // 60s: a sleeping camera can take ~30s just to establish the connection
+    // (per the M5Stack reference), then MTU (up to 5s) + service-discovery
+    // retries — 35s could kill a legitimate slow wake-up reconnect.
     this.clearConnectTimeout();
     this.connectTimeoutId = setTimeout(() => {
       const st = this.state;
@@ -375,10 +338,10 @@ export class CameraSession {
         || st === ConnectionState.Error || st === ConnectionState.Bonding) {
         return; // already settled — nothing to abort
       }
-      hilog.warn(0x0001, TAG, `${this.slog()}Connect watchdog fired (${connectTimeoutMs}ms) — aborting stalled connect`);
-      hilog.info(0x0001, TAG, `${this.slog()}[TIMING] elapsed=${this.timingElapsed()}ms cause=watchdog`);
+      hilog.warn(0x0001, TAG, `${this.slog()}Connect watchdog fired (60s) — aborting stalled pairing`);
       this.linkLostRootMarked = true;
       hilog.warn(0x0001, TAG, `${this.slog()}LINK LOST [ROOT] cause=watchdog`);
+      this.bleClient.disconnect();
       // Leave the shared reconnect scan for its other watchers; classic
       // discovery is only stopped when THIS session owns it (P0-2).
       this.hub.unwatchReconnect(this.cameraName);
@@ -386,12 +349,9 @@ export class CameraSession {
         try { connection.stopBluetoothDiscovery(); } catch (e) {}
       }
       // Route through the unified recovery path instead of dying on Error —
-      // auto-reconnect keeps trying while the camera is unavailable. Settle
-      // BEFORE disconnect() (which synchronously emits BleDisconnected and
-      // would clobber the failure reason).
-      this.handleLinkLost('连接超时');
-      this.bleClient.disconnect();
-    }, connectTimeoutMs);
+      // auto-reconnect keeps trying while the camera is unavailable.
+      this.handleLinkLost();
+    }, 60000);
 
     this.bleClient.connect(deviceId, (event: BleEvent) => {
       this.handleBleEvent(event);
@@ -451,6 +411,9 @@ export class CameraSession {
         this.startClassicDiscoveryForBonding();
         return;
       }
+      if (this.state === ConnectionState.Ready) {
+        this.hub.recordGeoWriteFailure(this.cameraName, '相机蓝牙连接已断开');
+      }
       // Only log the root cause once: when the disconnect comes from the BLE
       // stack itself (camera-side drop / link loss). A disconnect that follows
       // a watchdog kill or write error is a NESTED teardown whose root cause
@@ -458,26 +421,26 @@ export class CameraSession {
       if (!this.linkLostRootMarked) {
         hilog.warn(0x0001, TAG, `${this.slog()}LINK LOST cause=disconnected`);
       }
-      hilog.info(0x0001, TAG, `${this.slog()}[TIMING] elapsed=${this.timingElapsed()}ms cause=disconnected`);
       this.handleLinkLost();
     } else if (event instanceof BleError) {
       hilog.error(0x0001, TAG, `${this.slog()}BLE Error: ${event.message}`);
+      if (event.message.toLowerCase().includes('00002007')) {
+        this.hub.recordGeoWriteFailure(this.cameraName, '相机未确认 GPS 数据写入');
+      }
       // Link-death attribution: three-way split so a slow-waking camera's
       // death can be traced to exactly one cause. The P1 watchdog relaxation
       // (35s -> 60s) may shift it from watchdog to write timeout (3 x 10s) —
       // this split makes that shift visible in logs.
       let cause: string;
-      let userReason: string;
       if (event.message.startsWith('Write timeout')) {
-        cause = 'write-timeout'; userReason = '写入超时';
+        cause = 'write-timeout';
       } else if (event.message.startsWith('Write ')) {
-        cause = 'write-error'; userReason = '写入失败';
+        cause = 'write-error';
       } else {
-        cause = 'ble-error'; userReason = '蓝牙连接错误';
+        cause = 'ble-error';
       }
       this.linkLostRootMarked = true;
       hilog.warn(0x0001, TAG, `${this.slog()}LINK LOST [ROOT] cause=${cause}`);
-      hilog.info(0x0001, TAG, `${this.slog()}[TIMING] elapsed=${this.timingElapsed()}ms cause=${cause}`);
       // Pair-target hint: reaching Pairing means connect + service discovery
       // both succeeded — a PAIR write failure at that point almost always
       // means the camera is not treating this link as a pairing target (it is
@@ -487,16 +450,14 @@ export class CameraSession {
       }
       // Link-loss signal, not a terminal state: tear down and let
       // handleLinkLost decide between auto-reconnect and settling.
+      this.bleClient.disconnect();
+      // Leave the shared reconnect scan for its other watchers; classic
+      // discovery is only stopped when THIS session owns it (P0-2).
       this.hub.unwatchReconnect(this.cameraName);
       if (this.bondingDiscoveryActive || this.pendingBondingDiscovery) {
         try { connection.stopBluetoothDiscovery(); } catch (e) {}
       }
-      // handleLinkLost FIRST (settles with the concrete reason), disconnect
-      // AFTER — disconnect() synchronously emits BleDisconnected, which would
-      // re-enter handleBleEvent and overwrite the failure reason with the
-      // generic 连接已断开 message.
-      this.handleLinkLost(userReason);
-      this.bleClient.disconnect();
+      this.handleLinkLost();
     }
   }
 
@@ -658,6 +619,7 @@ export class CameraSession {
       this.checkBondedAndFinish();
     } else if (uuid.toLowerCase() === geoUuid.toLowerCase()) {
       hilog.info(0x0001, TAG, '[CHECKPOINT] GEO write confirmed');
+      this.hub.recordGeoWriteSuccess(this.cameraName);
     }
   }
 
@@ -671,20 +633,17 @@ export class CameraSession {
       return;
     }
 
-    // PAIR mode: stage the camera object but DO NOT persist yet — classic
-    // bonding may still fail (discovery timeout / user declines the dialog),
-    // and a record persisted here would ghost into the Connection page while
-    // the Pairing page correctly reports failure. finishBonding(true) persists
-    // it only once the bond actually succeeded.
+    // PAIR mode: save camera data first
     if (this.currentStage1) {
       const deviceId = this.bleClient.getDeviceId();
       const camera = new PairedCamera(
         this.cameraName || deviceId, deviceId, 1,
         this.currentStage1.device, this.currentStage1.nonce, this.controllerName
       );
+      this.hub.prefs.saveCameraSync(camera);
       this.savedCamera = camera;
       hilog.info(0x0001, TAG,
-        `${this.slog()}Camera staged for save: ${camera.name}`);
+        `[CHECKPOINT] Camera saved: ${camera.name}`);
     }
 
     // Disconnect BLE GATT first — camera requires this before classic bonding.
@@ -717,7 +676,7 @@ export class CameraSession {
       hilog.info(0x0001, TAG, '[CHECKPOINT] Classic discovery started');
     } catch (err) {
       hilog.error(0x0001, TAG, `[CHECKPOINT] startBluetoothDiscovery FAILED: ${JSON.stringify(err)}`);
-      this.finishBonding(false, '经典蓝牙发现启动失败');
+      this.finishBonding(false);
       return;
     }
 
@@ -764,7 +723,7 @@ export class CameraSession {
           this.statusMessage = 'Pairing with camera... accept dialog if shown.';
         } catch (err) {
           hilog.error(0x0001, TAG, `[CHECKPOINT] pairDevice FAILED: ${JSON.stringify(err)}`);
-          this.finishBonding(false, '配对请求失败');
+          this.finishBonding(false);
           return;
         }
 
@@ -787,7 +746,7 @@ export class CameraSession {
             hilog.warn(0x0001, TAG, `[CHECKPOINT] Bond failed (state=${bondData.state}) — finishing`);
             this.bondingDiscoveryActive = false;
             try { connection.stopBluetoothDiscovery(); } catch (e) {}
-            this.finishBonding(false, '配对被拒绝或失败');
+            this.finishBonding(false);
           }
         };
         connection.on('bondStateChange', this.bondStateCb);
@@ -795,7 +754,7 @@ export class CameraSession {
         setTimeout(() => {
           if (this.state === ConnectionState.Bonding) {
             hilog.warn(0x0001, TAG, '[CHECKPOINT] Bonding response timeout (20s)');
-            this.finishBonding(false, '绑定响应超时');
+            this.finishBonding(false);
           }
         }, 20000);
         return;
@@ -808,12 +767,12 @@ export class CameraSession {
       if (!bondAttempted && this.state === ConnectionState.Bonding) {
         hilog.warn(0x0001, TAG, '[CHECKPOINT] Classic discovery timeout — proceeding without bond');
         try { connection.stopBluetoothDiscovery(); } catch (e) {}
-        this.finishBonding(false, '未发现相机，配对超时');
+        this.finishBonding(false);
       }
     }, 15000);
   }
 
-  private handleLinkLost(failReason: string = ''): void {
+  private handleLinkLost(): void {
     if (this.state === ConnectionState.Ready) {
       if (this.savedCamera && this.hub.isKeepAlive(this.savedCamera.name)) {
         this.scheduleReconnect(); // sets Idle + refreshes GPS for remaining cameras
@@ -839,14 +798,15 @@ export class CameraSession {
     if (this.savedCamera && this.hub.isKeepAlive(this.savedCamera.name)) {
       this.scheduleReconnect();
     } else {
-      // setState BEFORE releaseOwnership (P0-A): PairingPage keys the failure
-      // message off isPairingTabOwner(), which is already false once the mutex
-      // is released — the message would fall through to "准备就绪".
-      this.setState(ConnectionState.Idle,
-        failReason !== '' ? failReason : '连接已断开，请重新连接');
+      // Release the mutex ONLY if we are the pairing session — connection
+      // sessions never hold it (P0-1).
       if (this.isPairMode && this.hub.getOwner() === 'pairing') {
         this.hub.releaseOwnership();
       }
+      // setState BEFORE clearing cameraName (P1-3); refreshGps() — NOT
+      // stopBackgroundTask() — so a sibling Ready camera's background task
+      // is never torn down by OUR failure (P1-4).
+      this.setState(ConnectionState.Idle, '连接已断开，请重新连接');
       this.cameraSerial = '';
       this.cameraName = '';
       this.hub.refreshGps();
@@ -868,12 +828,12 @@ export class CameraSession {
     const cam = this.savedCamera;
     this.reconnectTimerId = setTimeout(() => {
       this.reconnectTimerId = null;
-      // Reconnect unless classic BONDING holds the radio (a pairing scan or BLE
-      // handshake runs in parallel with a connect, so only bonding defers).
-      if (cam && this.hub.isKeepAlive(cam.name) && !this.hub.isPairingBonding()) {
+      // Reconnect unless the pairing tab owns the resource (pairing is serial;
+      // a Ready session's owner is already released so 'none' still reconnects).
+      if (cam && this.hub.isKeepAlive(cam.name) && this.hub.getOwner() !== 'pairing') {
         this.startReconnect(cam);
       } else if (cam && this.hub.isKeepAlive(cam.name)) {
-        // Bonding holds the radio right now — re-arm at the SAME backoff step
+        // Pairing owns the radio right now — re-arm at the SAME backoff step
         // (retries was already incremented by this firing; undo it so the
         // schedule below re-computes the same delay). Dropping the attempt
         // here would strand the camera until some unrelated event pokes it.
@@ -904,38 +864,21 @@ export class CameraSession {
     if (this.bondStateCb) { try { connection.off('bondStateChange', this.bondStateCb); } catch (e) {} this.bondStateCb = null; }
   }
 
-  private finishBonding(bonded: boolean, failMessage: string = ''): void {
+  private finishBonding(bonded: boolean): void {
     this.bondingDiscoveryActive = false;
     this.pendingBondingDiscovery = false;
     this.unregisterBondListeners();
     try { connection.stopBluetoothDiscovery(); } catch (e) {}
-    if (bonded) {
-      // Only a real BONDED marks pairing complete — persist the staged camera
-      // NOW (it was staged in checkBondedAndFinish, before the BLE teardown).
-      this.pairingStep = 6;
-      if (this.isPairMode && this.savedCamera) {
-        this.hub.prefs.saveCameraSync(this.savedCamera);
-        hilog.info(0x0001, TAG, `${this.slog()}Camera saved: ${this.savedCamera.name}`);
-        this.hub.notifyDevicesChanged(); // Pairing page flips this to 已配对
-      }
-    } else {
-      // Bond failed — discard the staged record so nothing ghosts into the
-      // Connection page, and keep pairingStep < 6 so PairingPage reports
-      // failure instead of a false "配对成功" dialog.
-      if (this.isPairMode) {
-        this.savedCamera = null;
-      }
-    }
+    // Only a real BONDED marks pairing complete. On failure keep pairingStep
+    // < 6 so PairingPage does not show a false "配对成功" dialog.
+    if (bonded) this.pairingStep = 6;
     // Pairing mode: BLE was disconnected for classic bonding. Set Idle — user must
-    // reconnect manually from ConnectionPage. Carry the failure reason so the
-    // Pairing page can tell timeout vs. user-decline instead of silent "准备就绪".
+    // reconnect manually from ConnectionPage.
     // Connection mode: BLE remains connected. Ready + GPS loop.
     if (this.hub.getOwner() === 'pairing') {
-      this.setState(ConnectionState.Idle, bonded ? '' : (failMessage !== '' ? failMessage : '配对失败'));
+      this.setState(ConnectionState.Idle, '');
       this.hub.releaseOwnership(); // after setState so listener sees owner='pairing' for dialog
     } else {
-      hilog.info(0x0001, TAG, `${this.slog()}[TIMING] elapsed=${this.timingElapsed()}ms cause=ready`);
-      this.attemptStart = 0; // attempt concluded — next disconnect isn't a connect-phase event
       this.setState(ConnectionState.Ready,
         '已连接');
       this.hub.refreshGps();
@@ -947,12 +890,22 @@ export class CameraSession {
     hilog.info(0x0001, TAG, `${this.slog()}onBonded()`);
     this.pairingStep = 6;
 
-    // RECONNECT mode only — PAIR mode never reaches here (classic bonding is
-    // handled by checkBondedAndFinish → finishBonding, which persists the
-    // staged camera only on a real BONDED). Reconnects already have saved data.
+    // Only save for PAIR mode (new cameras). Reconnects already have saved data.
+    if (this.isPairMode && this.currentStage1) {
+      const deviceId = this.bleClient.getDeviceId();
+      const camera = new PairedCamera(
+        this.cameraName || deviceId, deviceId, 1,
+        this.currentStage1.device, this.currentStage1.nonce,
+        this.controllerName
+      );
+      this.hub.prefs.saveCameraSync(camera);
+      hilog.info(0x0001, TAG,
+        `[CHECKPOINT] Paired camera saved: ${camera.name}`);
+    }
+
+    // RECONNECT mode: BLE is still connected, go Ready + GPS
+    // PAIR mode: handled by checkBondedAndFinish → classic bonding → finishBonding
     if (!this.isPairMode) {
-      hilog.info(0x0001, TAG, `${this.slog()}[TIMING] elapsed=${this.timingElapsed()}ms cause=ready`);
-      this.attemptStart = 0; // attempt concluded — next disconnect isn't a connect-phase event
       this.setState(ConnectionState.Ready, '已连接');
       this.hub.refreshGps();
       // Connection ops hold no Hub mutex — nothing to release here (P0-1).

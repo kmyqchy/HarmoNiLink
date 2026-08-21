@@ -12,4 +12,7 @@ export class GpsData {
   satellites: number = -1; // -1 = unknown; real count (>= 0) once GNSS reports
   hasFix: boolean = false;
   lastUpdateTime: string = '--';
+  lastLocationAt: number = 0;
+  lastLocationAccuracy: number = -1;
+  lastLocationError: string = '';
 }

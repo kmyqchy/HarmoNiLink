@@ -9,11 +9,13 @@
  * MessagesCommonView pattern (requires HdsNavigation ancestor).
  */
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { bundleManager, common } from '@kit.AbilityKit';
-import { cameraService, ConnectionState, CameraStateEvent } from '../service/CameraService';
+import { bundleManager } from '@kit.AbilityKit';
+import {
+  cameraService, ConnectionState, CameraStateEvent, GpsDeliveryHealth
+} from '../service/CameraService';
 import { PairedCamera } from '../ble/protocol/NikonPairingEngine';
+import { ConnectionPolicy, connectionPolicyDescription, connectionPolicyLabel } from '../service/ConnectionPolicy';
 import { HdsNavDestination, ScrollEffectType, hdsMaterial, HdsListItem } from '@kit.UIDesignKit';
-import { commentManager } from '@kit.AppGalleryKit';
 
 const TAG = 'HarmoNiLink-ConnectionPage';
 
@@ -30,32 +32,26 @@ export struct ConnectionPage {
   @State cameraStatuses: CameraStatus[] = [];
   @State logMessages: string[] = [];
   @State showLogs: boolean = false;
-  @State showAbout: boolean = false; // 关于 half-modal sheet
-  // GPS data mirrored as @State so ArkUI detects changes
-  @State gpsLat: string = '--';
-  @State gpsLon: string = '--';
-  @State gpsAlt: string = '--';
-  @State gpsSats: string = '--';
-  @State gpsHasFix: boolean = false;
-  @State gpsTime: string = '--';
   @State appVersion: string = '';
   @State titleSub: string = '';
   @State owner: string = 'none'; // synced from cameraService — drives @State re-render
-  @State controllerName: string = ''; // per-install name shown on the camera
+  @State connectionPolicy: ConnectionPolicy = ConnectionPolicy.Auto;
   // Bumped ONLY when a toggle must visually snap back after a refused flip.
   // Part of the ForEach key: normal list reloads keep keys stable so toggles
   // are NOT recreated (recreation in the same frame as the touch kills the
   // switch animation and can desync the visual from the persisted flag).
   @State revertTick: number = 0;
   private scroller: Scroller = new Scroller();
-  private gpsTimer: number = -1;
   private offStateListener: (() => void) | null = null;
+
+  private isPairingOwner(): boolean { return this.owner === 'pairing'; }
+  private isConnectionOwner(): boolean { return this.owner === 'connection'; }
 
   aboutToAppear(): void {
     hilog.info(0x0001, TAG, '[CHECKPOINT] ConnectionPage aboutToAppear');
     this.loadAppVersion();
     this.loadSavedCameras();
-    this.controllerName = cameraService.getControllerName();
+    this.connectionPolicy = cameraService.getConnectionPolicy();
     this.offStateListener = cameraService.setStateListener((event: CameraStateEvent) => {
       // Sync owner first — all derived helpers depend on @State reactivity
       this.owner = cameraService.getOwner();
@@ -65,8 +61,8 @@ export struct ConnectionPage {
       this.logMessages = [...this.logMessages.slice(-49),
         `[${new Date().toLocaleTimeString()}] [${event.cameraName || '全局'}] ${event.state}: ${event.message}`];
       // Title bar subtitle — show progress only for our own operations
-      if (cameraService.isPairingBonding()) {
-        this.titleSub = '正在经典蓝牙绑定';
+      if (this.isPairingOwner()) {
+        this.titleSub = '配对页操作中';
       } else if (event.cameraName !== '' && (event.state === ConnectionState.Scanning
         || event.state === ConnectionState.Connecting || event.state === ConnectionState.Discovering
         || event.state === ConnectionState.Pairing || event.state === ConnectionState.Bonding)) {
@@ -78,14 +74,12 @@ export struct ConnectionPage {
         this.loadSavedCameras();
       }
     });
-    this.gpsTimer = setInterval(() => { this.syncGps(); }, 1000);
     // prefs init is async — the first loadSavedCameras() may see an empty
     // cache. Re-read once it has certainly settled (also triggers reconcile).
     setTimeout(() => { this.loadSavedCameras(); }, 1500);
   }
 
   aboutToDisappear(): void {
-    if (this.gpsTimer !== -1) { clearInterval(this.gpsTimer); this.gpsTimer = -1; }
     if (this.offStateListener) { this.offStateListener(); this.offStateListener = null; }
   }
 
@@ -100,14 +94,19 @@ export struct ConnectionPage {
     return this.cameraStatuses.find((c) => c.name === name);
   }
 
-  private syncGps(): void {
-    const gps = cameraService.gpsData;
-    this.gpsLat = gps.latitude.toFixed(6);
-    this.gpsLon = gps.longitude.toFixed(6);
-    this.gpsAlt = `${gps.altitude.toFixed(1)} m`;
-    this.gpsSats = gps.satellites >= 0 ? `${gps.satellites}` : '--';
-    this.gpsHasFix = gps.hasFix;
-    this.gpsTime = gps.lastUpdateTime;
+  private relativeTime(timestamp: number): string {
+    if (timestamp <= 0) return '--';
+    const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+    if (seconds < 5) return '刚刚';
+    if (seconds < 60) return `${seconds} 秒前`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes} 分钟前`;
+    return new Date(timestamp).toLocaleTimeString();
+  }
+
+  private selectConnectionPolicy(policy: ConnectionPolicy): void {
+    cameraService.setConnectionPolicy(policy);
+    this.connectionPolicy = policy;
   }
 
   /**
@@ -116,10 +115,9 @@ export struct ConnectionPage {
    */
   private onConnectToggle(cam: PairedCamera, on: boolean): void {
     if (on) {
-      if (cameraService.isPairingBonding()) {
-        // Classic bonding holds the radio exclusively — defer a new connect.
-        // (A pairing scan/handshake runs in parallel, so only bonding blocks.)
-        this.getUIContext().getPromptAction().showToast({ message: '正在经典蓝牙绑定，请稍后再开启连接', duration: 2000 });
+      if (this.isPairingOwner()) {
+        // Starting a connect needs the radio — pairing owns it exclusively.
+        this.getUIContext().getPromptAction().showToast({ message: '配对进行中，请稍后再开启连接', duration: 2000 });
         this.revertToggle();
         return;
       }
@@ -189,7 +187,7 @@ export struct ConnectionPage {
         cameraService.markConnectHintShown();
         this.getUIContext().getPromptAction().showDialog({
           title: '连接提示',
-          message: '为获得稳定连接，推荐：\n\n1. 在相机设置中开启「关闭时发送」——相机休眠/关机后仍保持连接，本 App 可自动重连。\n\n2. 确保定位权限设为「始终允许」——应用在后台时才能持续下发 GPS。',
+          message: '为获得稳定连接，推荐：\n\n1. 在相机设置中开启「关闭时发送」——相机休眠/关机后仍保持连接，本 App 可自动重连。\n\n2. 保持设备的连接开关开启——断开后自动持续重连，直到相机恢复。',
           buttons: [{ text: '继续连接', color: $r('app.color.brand') }]
         }).then(() => {
           // Re-check after the dialog too — it can stay up for a long time.
@@ -220,7 +218,7 @@ export struct ConnectionPage {
    * connects at random-looking moments.
    */
   private reconcileConnections(): void {
-    if (cameraService.isPairingBonding()) return; // only classic bonding blocks
+    if (this.isPairingOwner()) return;
     for (const cam of this.savedCameras) {
       if (!cam.keepAlive) continue;
       if (cameraService.isCameraConnected(cam.name) || cameraService.isCameraBusy(cam.name)) continue;
@@ -302,11 +300,19 @@ export struct ConnectionPage {
     return this.stateLabel(st);
   }
 
+  private cameraHealthText(cam: PairedCamera): string {
+    const health: GpsDeliveryHealth = cameraService.getGpsHealth(cam.name);
+    if (health.lastGeoWriteAt > 0) return `GPS ${this.relativeTime(health.lastGeoWriteAt)} 已确认`;
+    if (health.lastError !== '') return health.lastError;
+    if (cameraService.isCameraConnected(cam.name)) return 'GPS 等待确认';
+    return 'GPS 未下发';
+  }
+
   @Builder pairingNotice() {
     Column() {
       Row({ space: 8 }) {
         Circle({ width: 8, height: 8 }).fill($r('app.color.warning'))
-        Text('正在经典蓝牙绑定，连接操作已暂停').fontSize(13).fontColor($r('app.color.warning'))
+        Text('配对页正在进行设备配对，连接操作已暂停').fontSize(13).fontColor($r('app.color.warning'))
       }
     }
     .width('100%').alignItems(HorizontalAlign.Start)
@@ -316,55 +322,34 @@ export struct ConnectionPage {
     .margin({ bottom: 12 })
   }
 
-  /** Always-present GPS card — stable layout, no jump on connect/disconnect.
-   * The status light is ALWAYS visible (grey = nothing connected, yellow =
-   * acquiring / connecting, green = heartbeat running with a fix) and
-   * replaces the old 定位 row. */
-  @Builder gpsCard() {
+  @Builder policyOption(policy: ConnectionPolicy, label: string) {
     Column() {
-      Row() {
-        Text('GPS 信息').fontSize(16).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
-        Blank()
-        Circle({ width: 8, height: 8 }).fill(this.gpsLightColor())
-        Text(this.gpsLightLabel()).fontSize(11).fontColor(this.gpsLightColor()).margin({ left: 6 })
-      }.width('100%').margin({ bottom: 10 })
-      GpsRow({ label: '配对名称', value: this.controllerName })
-      Divider().strokeWidth(0.5).color($r('app.color.divider')).margin({ top: 4, bottom: 6 })
-      GpsRow({ label: '纬度', value: this.gpsLat })
-      GpsRow({ label: '经度', value: this.gpsLon })
-      GpsRow({ label: '海拔', value: this.gpsAlt })
-      GpsRow({ label: '卫星数', value: this.gpsSats })
-      GpsRow({ label: '更新时间', value: this.gpsTime })
+      Text(label).fontSize(12).fontWeight(this.connectionPolicy === policy ? FontWeight.Medium : FontWeight.Normal)
+        .fontColor(this.connectionPolicy === policy ? Color.White : $r('app.color.text_secondary'))
+    }
+    .layoutWeight(1).height(34).justifyContent(FlexAlign.Center).alignItems(HorizontalAlign.Center)
+    .borderRadius(6)
+    .backgroundColor(this.connectionPolicy === policy ? $r('app.color.brand') : $r('app.color.page_background'))
+    .onClick(() => { this.selectConnectionPolicy(policy); })
+  }
+
+  @Builder connectionPolicyCard() {
+    Column() {
+      Text('连接策略').fontSize(16).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary'))
+      Text(connectionPolicyDescription(this.connectionPolicy)).fontSize(12).fontColor($r('app.color.text_secondary'))
+        .width('100%').margin({ top: 4, bottom: 10 })
+      Row({ space: 4 }) {
+        this.policyOption(ConnectionPolicy.PowerSaving, '省电')
+        this.policyOption(ConnectionPolicy.Balanced, '均衡')
+        this.policyOption(ConnectionPolicy.Stable, '稳定')
+        this.policyOption(ConnectionPolicy.Auto, '自动')
+      }.width('100%')
     }
     .width('100%').alignItems(HorizontalAlign.Start)
-    .padding({ left: 16, right: 16, top: 12, bottom: 16 })
+    .padding({ left: 16, right: 16, top: 12, bottom: 14 })
     .borderRadius(16).backgroundColor($r('app.color.card_background'))
     .shadow({ radius: 12, color: '#0D000000', offsetY: 2 })
     .margin({ top: 12 })
-  }
-
-  private anyCameraReady(): boolean {
-    return this.cameraStatuses.some((c) => c.state === ConnectionState.Ready);
-  }
-
-  private anyCameraBusy(): boolean {
-    return this.cameraStatuses.some((c) => c.state !== ConnectionState.Ready && c.state !== ConnectionState.Idle);
-  }
-
-  private gpsLightColor(): ResourceColor {
-    if (this.anyCameraReady()) {
-      return this.gpsHasFix ? $r('app.color.success') : $r('app.color.warning');
-    }
-    if (this.anyCameraBusy()) return $r('app.color.warning'); // connecting / acquiring
-    return $r('app.color.text_secondary'); // nothing connected — grey
-  }
-
-  private gpsLightLabel(): string {
-    if (this.anyCameraReady()) {
-      return this.gpsHasFix ? '定位下发中' : '正在获取';
-    }
-    if (this.anyCameraBusy()) return '正在连接';
-    return '未连接';
   }
 
   @Builder savedDevicesSection() {
@@ -419,6 +404,9 @@ export struct ConnectionPage {
               .fontSize(11).fontColor(this.stateColor(this.getCameraStatus(cam.name)?.state ?? ConnectionState.Idle))
               .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           }.margin({ top: 3 })
+          Text(this.cameraHealthText(cam))
+            .fontSize(10).fontColor($r('app.color.text_secondary'))
+            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).margin({ top: 2 })
         }.layoutWeight(1).alignItems(HorizontalAlign.Start)
       Toggle({ type: ToggleType.Switch, isOn: cam.keepAlive })
         // Always interactive: turning OFF is a cancel and must work even
@@ -438,28 +426,10 @@ export struct ConnectionPage {
 
   @Builder logSection() {
     Column() {
-      // 关于 — settings-style row with chevron (half-modal sheet)
       Row() {
-        Text('关于').fontSize(16).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary')).layoutWeight(1)
-        SymbolGlyph($r('sys.symbol.chevron_right'))
-          .fontSize(18).fontColor([$r('app.color.text_secondary')])
-      }
-      .width('100%').padding({ left: 12, right: 12, top: 14, bottom: 14 })
-      .onClick(() => { this.showAbout = true; })
-
-      Divider().strokeWidth(0.5).color($r('app.color.divider')).margin({ left: 12, right: 12 })
-
-      // 日志 — collapsible, chevron rotates down when expanded
-      Row() {
-        Text('日志').fontSize(16).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary')).layoutWeight(1)
-        SymbolGlyph($r('sys.symbol.chevron_right'))
-          .fontSize(18).fontColor([$r('app.color.text_secondary')])
-          .rotate({ angle: this.showLogs ? 90 : 0 })
-          .animation({ duration: 200, curve: Curve.EaseOut })
-      }
-      .width('100%').padding({ left: 12, right: 12, top: 14, bottom: 14 })
-      .onClick(() => { this.showLogs = !this.showLogs; })
-
+        Text('日志').fontSize(16).fontWeight(FontWeight.Medium).fontColor($r('app.color.text_primary')); Blank()
+        Text(this.showLogs ? '收起' : '展开').fontSize(13).fontColor($r('app.color.brand'))
+      }.width('100%').onClick(() => { this.showLogs = !this.showLogs; })
       if (this.showLogs) {
         Column() {
           if (this.logMessages.length > 0) {
@@ -467,99 +437,18 @@ export struct ConnectionPage {
               Text(msg).fontSize(10).fontColor($r('app.color.text_secondary')).width('100%').padding({ top: 1, bottom: 1 })
             })
           } else { Text('暂无日志').fontSize(12).fontColor($r('app.color.text_secondary')).padding({ top: 8 }) }
-        }.width('100%').padding({ left: 12, right: 12, bottom: 12 })
+          if (this.appVersion) {
+            Text(this.appVersion).fontSize(11).fontColor($r('app.color.text_secondary'))
+              .width('100%').textAlign(TextAlign.Center).padding({ top: 8 })
+          }
+        }.width('100%').margin({ top: 8 })
       }
     }
     .width('100%').alignItems(HorizontalAlign.Start)
-    .padding({ top: 4, bottom: 4 })
+    .padding({ left: 16, right: 16, top: 12, bottom: 16 })
     .borderRadius(16).backgroundColor($r('app.color.card_background'))
     .shadow({ radius: 12, color: '#0D000000', offsetY: 2 })
     .margin({ top: 12 })
-  }
-
-  /** 关于 half-modal (bindSheet) — app icon/name centered, settings-style rows. */
-  @Builder aboutSheet() {
-    Column() {
-      Image($r('app.media.app_icon')).width(72).height(72).borderRadius(18).margin({ top: 36 })
-      Text('NiLink').fontSize(22).fontWeight(FontWeight.Bold).margin({ top: 14 })
-      Text('HarmoNiLink').fontSize(13).fontColor($r('app.color.text_secondary')).margin({ top: 2 })
-
-      Column() {
-        Row() {
-          Text('应用版本').fontSize(16).fontColor($r('app.color.text_primary')).layoutWeight(1)
-          Text(this.appVersion).fontSize(14).fontColor($r('app.color.text_secondary'))
-        }.width('100%').padding({ left: 16, right: 12, top: 14, bottom: 14 })
-
-        Divider().strokeWidth(0.5).color($r('app.color.divider')).margin({ left: 16, right: 12 })
-
-        Row() {
-          Text('开源协议').fontSize(16).fontColor($r('app.color.text_primary')).layoutWeight(1)
-          Text('Mulan PSL v2').fontSize(14).fontColor($r('app.color.text_secondary')).margin({ right: 4 })
-          SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(18).fontColor([$r('app.color.text_secondary')])
-        }.width('100%').padding({ left: 16, right: 12, top: 14, bottom: 14 })
-        .onClick(() => { this.onAboutLicense(); })
-
-        Divider().strokeWidth(0.5).color($r('app.color.divider')).margin({ left: 16, right: 12 })
-
-        Row() {
-          Text('开源仓库').fontSize(16).fontColor($r('app.color.text_primary')).layoutWeight(1)
-          SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(18).fontColor([$r('app.color.text_secondary')])
-        }.width('100%').padding({ left: 16, right: 12, top: 14, bottom: 14 })
-        .onClick(() => { this.onAboutRepo(); })
-
-        Divider().strokeWidth(0.5).color($r('app.color.divider')).margin({ left: 16, right: 12 })
-
-        Row() {
-          Text('做个评价').fontSize(16).fontColor($r('app.color.text_primary')).layoutWeight(1)
-          SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(18).fontColor([$r('app.color.text_secondary')])
-        }.width('100%').padding({ left: 16, right: 12, top: 14, bottom: 14 })
-        .onClick(() => { this.onAboutComment(); })
-
-        Divider().strokeWidth(0.5).color($r('app.color.divider')).margin({ left: 16, right: 12 })
-
-        Row() {
-          Text('重置引导').fontSize(16).fontColor($r('app.color.text_primary')).layoutWeight(1)
-          SymbolGlyph($r('sys.symbol.chevron_right')).fontSize(18).fontColor([$r('app.color.text_secondary')])
-        }.width('100%').padding({ left: 16, right: 12, top: 14, bottom: 14 })
-        .onClick(() => { this.onAboutReset(); })
-      }
-      .width('100%').borderRadius(16).backgroundColor($r('app.color.card_background'))
-      .margin({ top: 32, bottom: 24 })
-
-      Blank().layoutWeight(1)
-    }
-    .width('100%').height('100%').padding({ left: 16, right: 16 })
-  }
-
-  private openExternalLink(url: string): void {
-    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    ctx.openLink(url, { appLinkingOnly: false })
-      .then(() => {})
-      .catch((e: Error) => { hilog.warn(0x0001, TAG, `openLink fail: ${e.message}`); });
-  }
-
-  private onAboutLicense(): void {
-    this.openExternalLink('https://license.coscl.org.cn/MulanPSL2');
-  }
-
-  private onAboutRepo(): void {
-    this.openExternalLink('https://github.com/Octopustank/HarmoNiLink');
-  }
-
-  private onAboutComment(): void {
-    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    try {
-      commentManager.showCommentDialog(ctx).then(() => {}).catch((e: Error) => {
-        hilog.warn(0x0001, TAG, `showCommentDialog fail: ${e.message}`);
-      });
-    } catch (e) {
-      hilog.warn(0x0001, TAG, `showCommentDialog throw: ${JSON.stringify(e)}`);
-    }
-  }
-
-  private onAboutReset(): void {
-    cameraService.resetOnboarding();
-    this.getUIContext().getPromptAction().showToast({ message: '已重置引导提示，下次操作将重新显示', duration: 2500 });
   }
 
   build() {
@@ -568,10 +457,10 @@ export struct ConnectionPage {
         Column() {
           Blank().height(56)
 
-          if (cameraService.isPairingBonding()) { this.pairingNotice() }
-          this.gpsCard()
+          if (this.isPairingOwner()) { this.pairingNotice() }
+          this.connectionPolicyCard()
 
-          Text('连接开关打开的相机将保持连接，断开后自动重连。\n左滑设备卡片可删除配对；未配对的相机请先在「配对」页扫描添加。\n需要后台下发数据，请在系统设置中允许始终定位。')
+          Text('连接开关打开的相机将保持连接，断开后自动重连。\n左滑设备卡片可删除配对。\n需要后台下发数据，请在系统设置中允许始终定位。')
             .fontSize(11).fontColor($r('app.color.text_secondary'))
             .width('100%').textAlign(TextAlign.Center).padding({ left: 4, right: 4 })
             .margin({ top: 12 })
@@ -605,23 +494,5 @@ export struct ConnectionPage {
       },
     })
     .hideBackButton(true)
-    .bindSheet($$this.showAbout, this.aboutSheet(), {
-      height: SheetSize.LARGE,
-      dragBar: true,
-      showClose: true,
-      backgroundColor: $r('app.color.page_background')
-    })
-  }
-}
-
-@Component
-struct GpsRow {
-  @Prop label: string = '';
-  @Prop value: string = '--';
-  build() {
-    Row() {
-      Text(this.label).fontSize(13).fontColor($r('app.color.text_secondary')).width(64)
-      Text(this.value).fontSize(13).fontColor($r('app.color.text_primary')).layoutWeight(1)
-    }.width('100%').padding({ top: 2, bottom: 2 })
   }
 }

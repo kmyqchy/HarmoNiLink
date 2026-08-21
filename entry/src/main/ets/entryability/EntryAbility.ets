@@ -23,15 +23,12 @@ const TAG = 'HarmoNiLink-EntryAbility';
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(0x0001, TAG, `[CHECKPOINT] EntryAbility.onCreate()`);
-    // Initialize the service EARLY (before MainPage renders) so the async
-    // prefs.load has time to finish — MainPage then reads the persisted tab
-    // index synchronously without flashing the wrong tab.
-    cameraService.setContext(this.context);
     this.logAppVersion();
   }
 
   onDestroy(): void {
     hilog.info(0x0001, TAG, '[CHECKPOINT] EntryAbility.onDestroy()');
+    cameraService.stopSystemLiveView();
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
